@@ -1,0 +1,47 @@
+# SST_swin 0.25° OISST ★anomaly-persistence residual 타깃.
+#   anomaly z = (sst − c_mu[doy]) / c_sig[doy] (±5 clip). 모델 = persistence(a_IC) + residual.
+#   head zero-init → 학습 시작점 = anomaly persistence (vs_plot.ipynb: 42일 내 climatology crossover 없음).
+#   raw 타깃(sst_swin_0p25_oisst) 대비 리드별 RMSE/ACC 비교용 — evaluate.py 동일 프로토콜.
+#
+# 실행:
+#   uv run accelerate launch --config_file SST_swin/accelerate.yaml -m SST_swin.train \
+#       --config SST_swin/configs/sst_swin_0p25_oisst_residual.yaml
+#   uv run accelerate launch --config_file SST_swin/accelerate.yaml -m SST_swin.evaluate \
+#       --config SST_swin/configs/sst_swin_0p25_oisst_residual.yaml \
+#       --ckpt SST_swin/outputs/sst_swin_0p25_oisst_residual/ckpt_best.pt
+data:
+  forcing_zarr: data/oisst_mean_1982_2023.zarr    # OISST 0.25° sst(°C, land NaN) + lsmask(1=ocean)
+  clim_npz: data/oisst_sst_climatology_025.npz    # OISST per-doy c_mu/c_sig (anomaly z 표준화 + eval z→°C)
+  target: residual                                # ★ anomaly-persistence residual (persist skip + zero-init)
+  train: ['1982-01-01', '2019-12-31']
+  val:   ['2020-01-01', '2021-12-31']
+  test:  ['2022-01-01', '2022-12-31']
+  T: 14
+  stride: 1
+  augment: true
+  load_in_memory: true
+
+model:
+  patch_size: 4
+  embed_dim: 96
+  window_size: 5
+  depths: [2, 2, 2]
+  depths_up: [2, 2]
+  num_heads: [3, 6, 12]
+  mlp_ratio: 4.0
+  dropout: 0.0
+  ape: false
+
+train:
+  batch_size: 24
+  lr: 1.0e-3
+  weight_decay: 0.1
+  epochs: 100
+  patience: 15
+  num_workers: 8
+  seed: 42
+  amp: true
+  out_dir: SST_swin/outputs/sst_swin_0p25_oisst_residual   # ★ raw ckpt 와 분리 (덮어쓰기 방지)
+
+eval:
+  stride: 5

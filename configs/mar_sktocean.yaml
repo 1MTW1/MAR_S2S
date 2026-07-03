@@ -1,0 +1,80 @@
+# S2S_inject 14-day ★ERA5 skt-ocean 직접주입 (OISST 대조군: 같은 direct 파이프라인, ocean 값만 ERA5 skt)
+#   skt_proj 로 직접 임베딩(인코더 없음). ocean=항상 visible 입력전용, 대기 latent + 육지 LST 만 생성.
+#   결합 skt 필드 = where(OISST ocean_mask, OISST 1° anom z, ERA5 skt anom z).
+#
+# 선행:
+#   python -m S2S_inject.data.regrid_oisst_1deg_oceanmean --min-ocean 8   # → data/oisst_1deg_oceanmean.zarr
+#   python -m S2S_inject.data.compute_oisst_climatology --sst-zarr data/oisst_1deg_oceanmean.zarr \
+#       --output data/oisst_1deg_climatology.npz
+#
+# 실행:
+#   accelerate launch --config_file S2S_inject/configs/accelerate.yaml -m S2S_inject.train_s2s \
+#       --config S2S_inject/configs/s2s_inject_14day_oisst1deg.yaml
+
+data:
+  latents_zarr: data/era5_latents_sst_s2s.zarr     # 14ch DCAE latent (재사용)
+  var: latents
+  latent_stats: S2S_SST/static/era5_latent_stats.json
+  train: ['1982-01-01', '2019-12-31']
+  val: ['2020-01-01', '2021-12-31']
+  future_len: 14
+  input_len: 1
+  stride: 1
+  load_in_memory: true
+  target_std: 0.5
+  skt_anomaly_zarr: data/era5_skt_anomaly.zarr     # ERA5 skt z (육지 LST 생성 타깃 + land 부분)
+  skt_clip: 5.0
+  # ── ★ OISST 1° 직접주입 소스 (이 키 존재 시 direct 경로 활성) ──
+  oisst_1deg_zarr: data/oisst_1deg_oceanmean.zarr        # 4×4 ocean-mean + ocean_mask(≥8)
+  oisst_1deg_clim_npz: data/oisst_1deg_climatology.npz   # OISST 1° per-doy c_mu/c_sig (native z)
+  ocean_source: skt              # ★ ocean=ERA5 skt (OISST 대신) — leakage 상한 대조군. ocean_mask 는 OISST 것 유지
+  mask_seaice: true              # ★ OISST 기준 해빙권 제외 (open-ocean만 BC)
+  ice_thresh: -1.7
+  skt_ocean_thresh: 0.5                             # 18×18 토큰 ocean비율≥thresh → ocean 토큰
+
+model:
+  latent_channels: 216
+  latent_h: 10
+  latent_w: 20
+  embed_dim: 768
+  num_heads: 12
+  n_dual: 6
+  n_single: 6
+  mlp_ratio: 4.0
+  diff_width: 2048
+  diff_depth: 6
+  diff_batch_mul: 2
+  num_sampling_timesteps: 32
+  sigma_data: 0.5
+  mask_ratio_min: 0.5
+  dropout: 0.1
+  skt_patch: 18
+  skt_ocean_thresh: 0.5
+  skt_recon_weight: 0.3         # LST diffusion 손실 가중
+  det_weight: 0.5
+  det_max_frames: 10
+  use_sst_encoder: false        # ★ 인코더 없음 (직접주입)
+  ocean_proj: true              # ★ ocean 토큰 전용 Linear (SST↔LST 임베딩 분리)
+
+train:
+  batch_size: 24                # 0.25° 인코더 없어 메모리 여유(legacy skt 모델과 동급)
+  lr: 1.0e-4
+  weight_decay: 0.05
+  betas: [0.9, 0.95]
+  grad_clip: 1.0
+  num_epochs: 200
+  warmup_epochs: 5
+  ema_decay: 0.9999
+  use_ema: true
+  save_every_epochs: 10
+  checkpoint_every_epochs: 10
+  validate_every_epochs: 5
+  val_max_batches: null
+  num_workers: 8
+  amp: true
+  output_dir: S2S_inject/outputs/s2s_inject_14day_sktocean_200ep
+  seed: 42
+
+sample:
+  num_iter: 21
+  temperature: 1.0

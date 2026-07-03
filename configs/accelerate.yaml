@@ -1,0 +1,17 @@
+# S2S Accelerate 멀티-GPU 설정 (6 GPU). LaDCast2 패턴.
+# 사용:
+#   accelerate launch --config_file S2S/configs/accelerate.yaml -m S2S.train_dcae --config S2S/configs/dcae_s2s.yaml
+#   accelerate launch --config_file S2S/configs/accelerate.yaml -m S2S.train_s2s  --config S2S/configs/s2s.yaml
+# GPU 수 변경은 num_processes 만 조정. 단일 GPU 디버그는 그냥 `python -m S2S.train_*`.
+compute_environment: LOCAL_MACHINE
+distributed_type: MULTI_GPU
+downcast_bf16: 'no'
+gpu_ids: all
+machine_rank: 0
+main_training_function: main
+mixed_precision: bf16
+num_machines: 1
+num_processes: 6
+rdzv_backend: static
+same_network: true
+use_cpu: false
