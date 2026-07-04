@@ -29,7 +29,7 @@ from baseline.data.mar_dataset import S2SInjectDirectDataset
 from baseline.eval_utils import decode_sliced, load_inject, unpatch_skt
 
 OUT = "S2S_inject/outputs/s2s_inject_14day_sktocean_200ep/cycle1_gen.npz"
-ATM_CH = list(range(9))                                # 전 대기채널 t/u/v @300/500/850
+ATM_CH = [2, 5, 8]                                     # ★ 지표면(850hPa) t,u,v — 상층은 과적합 역효과 실증됨
 
 
 def build_ds(cfg, start, end, stride):
@@ -77,17 +77,16 @@ def gen(args):
         ot_m = otok[None].to(device).repeat(M, 1, 1)
         with torch.no_grad(), torch.autocast("cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
             fut_atmo, skt_full = model.sample_sst_direct(ic, tsm, sktm, ot_m, num_iter=21, temperature=1.0)
-        # ★ per-member skt (ens M개 각각 저장 → updater 데이터 M배). skt_full:(M,window,h,w,P²)
-        gen_m = np.stack([unpatch_skt(skt_full[m, 1:].float().cpu().numpy(), hh, ww, P)
-                          for m in range(M)], 0).astype(np.float16)                     # (M,T,180,360)
+        # ★ ens-mean skt (M멤버 평균 — per-member 학습은 train/test 분포불일치로 역효과 실증됨)
+        gen_z = unpatch_skt(skt_full[:, 1:].float().mean(0).cpu().numpy(), hh, ww, P)   # (T,180,360)
         fc_z = unpatch_skt(skt[1:].numpy(), hh, ww, P)                                  # 입력 BC(=forecast)
         atm = None
-        if dcae is not None:                                                            # ens-mean 대기 9ch
+        if dcae is not None:                                                            # ens-mean 지표면 대기 3ch
             with torch.no_grad():
                 dec = decode_sliced(fut_atmo.float().mean(0, keepdim=True), dcae, lat_mean, lat_std,
                                     fmean, fstd, cfg["data"].get("target_std"), 9)      # (1,T,9,180,360)
-            atm = np.asarray(dec[0][:, ATM_CH]).astype(np.float16)                      # (T,9,180,360)
-        recs.append((ds.ts[s0], fc_z.astype(np.float32), gen_m,
+            atm = np.asarray(dec[0][:, ATM_CH]).astype(np.float16)                      # (T,3,180,360) t/u/v@850
+        recs.append((ds.ts[s0], fc_z.astype(np.float32), gen_z.astype(np.float32),
                      era[s0 + 1: s0 + 1 + T], atm))
     # gather via file-per-rank (간단·안전)
     part = {"ics": np.array([r[0] for r in recs]),
@@ -136,23 +135,19 @@ def fit(args):
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     d = np.load(args.gen_npz)
     ics = pd.to_datetime([str(t) for t in d["ics"].astype(np.int64)], format="%Y%m%d%H")
-    fc, gen_, tru = d["fc"], d["gen"], d["tru"]                       # fc/tru (N,14,H,W), gen (N,M,14,H,W)
-    if gen_.ndim == 4:                                               # 구버전(ens-mean) 호환
-        gen_ = gen_[:, None]
-    M = gen_.shape[1]
-    gen_mean = gen_.astype(np.float32).mean(1)                        # (N,14,H,W) 배포/test 용
-    atm = d["atm"].astype(np.float32) if (args.use_atmo and "atm" in d.files) else None  # (N,14,9,H,W)
+    fc, gen_, tru = d["fc"], d["gen"], d["tru"]                       # 모두 (N,14,H,W) ens-mean
+    if gen_.ndim == 5:                                               # per-member 저장분(구버전) → ens-mean
+        gen_ = gen_.astype(np.float32).mean(1)
+    atm = d["atm"].astype(np.float32) if (args.use_atmo and "atm" in d.files) else None  # (N,14,3,H,W) t/u/v@850
     if args.use_atmo:
         assert atm is not None, "--use-atmo 인데 gen npz 에 atm 없음 (gen --dcae 로 재생성)"
-        if args.n_atmo:
-            atm = atm[:, :, :args.n_atmo]                            # 앞 N채널만 (9채널 효과 분리)
     od = xr.open_zarr("data/oisst_1deg_oceanmean.zarr"); ocean = od["ocean_mask"].values > 0
     cl = np.load("data/oisst_1deg_climatology.npz")
     vis = ocean & ~((np.nanmin(cl["c_mu"], axis=0) <= -1.7) & ocean)
     lat = od["lat"].values; w = (np.cos(np.deg2rad(lat)).clip(0)[:, None] * vis).astype(np.float32)
     H, Wd = vis.shape
-    tr = ics.year == 2020; te = ics.year == 2021
-    print(f"[fit] train IC {tr.sum()}×{M}mem={tr.sum()*M*14} samp / test IC {te.sum()} (ens-mean)  (2020/2021)")
+    tr = ics.year <= 2021; te = ics.year == 2022
+    print(f"[fit] train IC {tr.sum()} / test IC {te.sum()} (ens-mean, 2020/2021)")
 
     W = torch.from_numpy(w).to(dev)
     lead_ch = (np.arange(14, dtype=np.float32) / 13.0)
@@ -165,13 +160,12 @@ def fit(args):
         atm_std = atm[tr].reshape(-1, n_atm, H * Wd).std(axis=(0, 2)).astype(np.float32) + 1e-6
         print(f"[fit] atmo {n_atm}ch std={atm_std.round(2)}")
 
-    def batches(samp, bs, shuffle, use_mean):
-        """samp: (K,3) rows (i_win,i_mem,i_lead). use_mean 이면 gen=ens-mean(배포 일치)."""
+    def batches(samp, bs, shuffle):
+        """samp: (K,2) rows (i_win,i_lead). gen 은 ens-mean 고정(학습·test·배포 일치)."""
         order = np.random.permutation(len(samp)) if shuffle else np.arange(len(samp))
         for s in range(0, len(order), bs):
-            j = samp[order[s:s + bs]]; iw, im, il = j[:, 0], j[:, 1], j[:, 2]
-            gsrc = gen_mean[iw, il] if use_mean else gen_[iw, im, il].astype(np.float32)
-            g = gsrc * (~vis) if use_gen else np.zeros((len(iw), H, Wd), np.float32)
+            j = samp[order[s:s + bs]]; iw, il = j[:, 0], j[:, 1]
+            g = gen_[iw, il] * (~vis) if use_gen else np.zeros((len(iw), H, Wd), np.float32)
             ch = [fc[iw, il] * vis, g, np.broadcast_to(vis, (len(iw), H, Wd)),
                   np.broadcast_to(lead_ch[il][:, None, None], (len(iw), H, Wd))]
             if atm is not None:
@@ -180,18 +174,14 @@ def fit(args):
             yield (torch.from_numpy(x).to(dev), torch.from_numpy(tru[iw, il]).to(dev),
                    torch.from_numpy(fc[iw, il]).to(dev), il)
 
-    if args.train_mean:                                              # ★ 대조: 학습도 ens-mean (test 와 정합)
-        samp_tr = np.array([(iw, -1, il) for iw in np.where(tr)[0] for il in range(14)])
-        print(f"[fit] ★ train 도 ens-mean ({len(samp_tr)} samp)")
-    else:
-        samp_tr = np.array([(iw, im, il) for iw in np.where(tr)[0] for im in range(M) for il in range(14)])
-    samp_te = np.array([(iw, -1, il) for iw in np.where(te)[0] for il in range(14)])
+    samp_tr = np.array([(iw, il) for iw in np.where(tr)[0] for il in range(14)])
+    samp_te = np.array([(iw, il) for iw in np.where(te)[0] for il in range(14)])
     cin = 4 + n_atm
     net = TinyUNet(cin=cin).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=0.01)
     for ep in range(args.epochs):
         net.train(); tot = n = 0
-        for x, y, f0, _ in batches(samp_tr, args.bs, True, use_mean=args.train_mean):
+        for x, y, f0, _ in batches(samp_tr, args.bs, True):
             pr = f0 + net(x)                                          # fc + 보정
             loss = (((pr - y) ** 2) * W).sum() / (W.sum() * x.shape[0])
             opt.zero_grad(); loss.backward(); opt.step()
@@ -201,7 +191,7 @@ def fit(args):
     net.eval()
     acc_v = torch.zeros(7, 14, device=dev)                            # se_u, se_f, uo,uu, fo,ff, oo
     with torch.no_grad():
-        for x, y, f0, i_lead in batches(samp_te, args.bs, False, use_mean=True):
+        for x, y, f0, i_lead in batches(samp_te, args.bs, False):
             pr = f0 + net(x)
             for b in range(x.shape[0]):
                 k = int(i_lead[b])
@@ -222,10 +212,10 @@ def fit(args):
         print(f"+{k+1:<4d}{ru[-1]:>10.4f}{rf[-1]:>10.4f}{cu[-1]:>10.4f}{cf[-1]:>10.4f}")
     print(f"{'mean':>5}{np.mean(ru):>10.4f}{np.mean(rf):>10.4f}{np.mean(cu):>10.4f}{np.mean(cf):>10.4f}")
     tag = ("nogen" if args.no_gen else "gen") + ("_atmo" if atm is not None else "")
+    upd_path = os.path.join(os.path.dirname(args.gen_npz) or ".", f"cycle_updater_{tag}.pt")
     torch.save({"model": net.state_dict(), "cin": cin, "use_gen": use_gen,
-                "use_atmo": atm is not None, "atm_std": atm_std},
-               f"S2S_inject/outputs/s2s_inject_14day_sktocean_200ep/cycle_updater_{tag}.pt")
-    print(f"saved cycle_updater_{tag}.pt")
+                "use_atmo": atm is not None, "atm_std": atm_std}, upd_path)
+    print(f"saved {upd_path}")
 
 
 def apply(args):
@@ -280,8 +270,6 @@ def main():
     ap.add_argument("--bs", type=int, default=16)
     ap.add_argument("--no-gen", action="store_true", help="대조군: LST_gen 채널 0 (fc 후처리만)")
     ap.add_argument("--use-atmo", action="store_true", help="Atmo_gen 조건 추가")
-    ap.add_argument("--train-mean", action="store_true", help="학습도 ens-mean (per-member 대신, test 정합)")
-    ap.add_argument("--n-atmo", type=int, default=None, help="atmo 채널 앞 N개만 (기본 전체 9)")
     ap.add_argument("--updater", default="S2S_inject/outputs/s2s_inject_14day_sktocean_200ep/cycle_updater_gen.pt")
     ap.add_argument("--out-zarr", default="data/skt1deg_forecast_bc_v2.zarr")
     args = ap.parse_args()

@@ -72,7 +72,7 @@ train:
   val_max_batches: null
   num_workers: 8
   amp: true
-  output_dir: S2S_inject/outputs/s2s_inject_14day_sktocean_200ep
+  output_dir: baseline/outputs/mar
   seed: 42
 
 sample:

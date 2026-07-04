@@ -41,7 +41,7 @@ train:
   num_workers: 8
   seed: 42
   amp: true
-  out_dir: SST_swin/outputs/sst_swin_0p25_oisst_residual   # ★ raw ckpt 와 분리 (덮어쓰기 방지)
+  out_dir: baseline/outputs/swin
 
 eval:
   stride: 5
