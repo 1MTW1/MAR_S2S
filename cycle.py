@@ -29,6 +29,7 @@ from baseline.data.mar_dataset import S2SInjectDirectDataset
 from baseline.eval_utils import decode_sliced, load_inject, unpatch_skt
 
 OUT = "S2S_inject/outputs/s2s_inject_14day_sktocean_200ep/cycle1_gen.npz"
+LEAD = int(os.environ.get("LEAD", 14))          # ★ lead time (21일 실험: LEAD=21)
 ATM_CH = [2, 5, 8]                                     # ★ 지표면(850hPa) t,u,v — 상층은 과적합 역효과 실증됨
 
 
@@ -39,18 +40,19 @@ def build_ds(cfg, start, end, stride):
         start_date=start, end_date=end,
         oisst_1deg_zarr=dc["oisst_1deg_zarr"], oisst_1deg_clim_npz=dc["oisst_1deg_clim_npz"],
         skt_anomaly_zarr=dc["skt_anomaly_zarr"],
-        future_len=14, input_len=1, stride=stride, target_std=dc.get("target_std"),
+        future_len=LEAD, input_len=1, stride=stride, target_std=dc.get("target_std"),
         load_in_memory=True, skt_clip=dc.get("skt_clip", 5.0), skt_patch=dc.get("skt_patch", 18),
         ocean_thresh=dc.get("skt_ocean_thresh", 0.5), ocean_source="forecast",
         mask_seaice=dc.get("mask_seaice", False), ice_thresh=dc.get("ice_thresh", -1.7),
-        refined_zarr="data/skt1deg_refined_unet.zarr", forecast_zarr="data/skt1deg_forecast_bc.zarr")
+        refined_zarr=os.environ.get("REFINED_ZARR", "data/skt1deg_refined_unet.zarr"),
+        forecast_zarr=os.environ.get("FORECAST_ZARR", "data/skt1deg_forecast_bc.zarr"))
 
 
 def gen(args):
     acc = Accelerator(); device = acc.device
     model, cfg = load_inject(args.ckpt, device, use_ema=True)
     ds = build_ds(cfg, args.start, args.end, args.stride)
-    T, P, hh, ww = 14, ds.P, ds.h, ds.w
+    T, P, hh, ww = LEAD, ds.P, ds.h, ds.w
     era = xr.open_zarr(cfg["data"]["skt_anomaly_zarr"])["anomaly"].reindex(time=ds.time)\
         .values.astype(np.float32)                                     # true skt z 1°
     dcae = fmean = fstd = lat_mean = lat_std = None
@@ -150,7 +152,7 @@ def fit(args):
     print(f"[fit] train IC {tr.sum()} / test IC {te.sum()} (ens-mean, 2020/2021)")
 
     W = torch.from_numpy(w).to(dev)
-    lead_ch = (np.arange(14, dtype=np.float32) / 13.0)
+    lead_ch = (np.arange(LEAD, dtype=np.float32) / (LEAD - 1))
     use_gen = not args.no_gen
     if not use_gen:
         print("[fit] ★ 대조군: LST_gen 채널 제거 (fc 후처리 효과만 측정)")
@@ -174,8 +176,8 @@ def fit(args):
             yield (torch.from_numpy(x).to(dev), torch.from_numpy(tru[iw, il]).to(dev),
                    torch.from_numpy(fc[iw, il]).to(dev), il)
 
-    samp_tr = np.array([(iw, il) for iw in np.where(tr)[0] for il in range(14)])
-    samp_te = np.array([(iw, il) for iw in np.where(te)[0] for il in range(14)])
+    samp_tr = np.array([(iw, il) for iw in np.where(tr)[0] for il in range(LEAD)])
+    samp_te = np.array([(iw, il) for iw in np.where(te)[0] for il in range(LEAD)])
     cin = 4 + n_atm
     net = TinyUNet(cin=cin).to(dev)
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=0.01)
@@ -189,7 +191,7 @@ def fit(args):
         print(f"[ep{ep}] train mse(z)={tot/n:.4f}")
 
     net.eval()
-    acc_v = torch.zeros(7, 14, device=dev)                            # se_u, se_f, uo,uu, fo,ff, oo
+    acc_v = torch.zeros(7, LEAD, device=dev)                            # se_u, se_f, uo,uu, fo,ff, oo
     with torch.no_grad():
         for x, y, f0, i_lead in batches(samp_te, args.bs, False):
             pr = f0 + net(x)
@@ -206,7 +208,7 @@ def fit(args):
     print(f"\n[2021 test] open-ocean lat-weighted — updated(fc+LST_gen) vs fc 단독")
     print(f"{'lead':>5}{'RMSE_upd':>10}{'RMSE_fc':>10}{'corr_upd':>10}{'corr_fc':>10}")
     ru, rf, cu, cf = [], [], [], []
-    for k in range(14):
+    for k in range(LEAD):
         ru.append(np.sqrt(a[0, k] / nk)); rf.append(np.sqrt(a[1, k] / nk))
         cu.append(a[2, k] / np.sqrt(a[3, k] * a[6, k])); cf.append(a[4, k] / np.sqrt(a[5, k] * a[6, k]))
         print(f"+{k+1:<4d}{ru[-1]:>10.4f}{rf[-1]:>10.4f}{cu[-1]:>10.4f}{cf[-1]:>10.4f}")
@@ -236,19 +238,19 @@ def apply(args):
     cl = np.load("data/oisst_1deg_climatology.npz")
     vis = ocean & ~((np.nanmin(cl["c_mu"], axis=0) <= -1.7) & ocean)
     H, Wd = vis.shape
-    lead_ch = (np.arange(14, dtype=np.float32) / 13.0)[:, None, None]
+    lead_ch = (np.arange(LEAD, dtype=np.float32) / (LEAD - 1))[:, None, None]
     out = np.full_like(fc, np.nan)
     with torch.no_grad():
         for i in range(len(ics)):
             ch = [fc[i] * vis, gen_[i] * (~vis) if uk["use_gen"] else np.zeros_like(fc[i]),
-                  np.broadcast_to(vis, (14, H, Wd)).astype(np.float32),
-                  np.broadcast_to(lead_ch, (14, H, Wd))]
+                  np.broadcast_to(vis, (LEAD, H, Wd)).astype(np.float32),
+                  np.broadcast_to(lead_ch, (LEAD, H, Wd))]
             if atm is not None:
                 ch += list((atm[i] / uk["atm_std"][None, :, None, None]).transpose(1, 0, 2, 3))
             x = torch.from_numpy(np.stack(ch, 1).astype(np.float32)).to(dev)
             out[i] = np.clip(fc[i] + net(x).cpu().numpy(), -5, 5)
     xr.Dataset({"z": (("time", "lead", "lat", "lon"), out)},
-               coords={"time": ics.values, "lead": np.arange(1, 15),
+               coords={"time": ics.values, "lead": np.arange(1, LEAD + 1),
                        "lat": od["lat"].values, "lon": od["lon"].values},
                attrs={"desc": "cycle-2 updated BC (fc + updater[LST_gen(+atmo)])",
                       "updater": args.updater}).chunk({"time": 32}).to_zarr(args.out_zarr, mode="w")

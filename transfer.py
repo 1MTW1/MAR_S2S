@@ -34,7 +34,7 @@ from baseline.models.swin import UTransformer
 from baseline.recon import CB, _cpad, _blosc_off   # noqa: F401 (recon import 가 blosc/dask fork-safe 설정)
 
 _BASE = date(2000, 1, 1).toordinal()
-T = 14
+T = int(os.environ.get("LEAD", 14))            # ★ 21일 실험: LEAD=21
 
 
 def _doy(times):
